@@ -141,7 +141,8 @@ function parseEvent(tagged) {
     }
     fields[key] = line.slice(colonIdx + 1);
   }
-  return { lines, fields, feedId: tagged.feedId, prefix: tagged.prefix };
+  const startUTC = parseICalDateTime(fields['DTSTART'] || '', fields['DTSTART_TZID']);
+  return { lines, fields, feedId: tagged.feedId, prefix: tagged.prefix, startUTC };
 }
 
 function normalizeTitle(summary) {
@@ -185,6 +186,45 @@ function titlesMatch(a, b) {
   return diceCoefficient(na, nb) >= 0.75;
 }
 
+const WINDOWS_TZID_MAP = {
+  'Eastern Standard Time': 'America/New_York',
+  'Central Standard Time': 'America/Chicago',
+  'Mountain Standard Time': 'America/Denver',
+  'Pacific Standard Time': 'America/Los_Angeles',
+  'Atlantic Standard Time': 'America/Halifax',
+  'Newfoundland Standard Time': 'America/St_Johns',
+  'Hawaiian Standard Time': 'Pacific/Honolulu',
+  'Alaskan Standard Time': 'America/Anchorage',
+  'US Mountain Standard Time': 'America/Phoenix',
+  'Canada Central Standard Time': 'America/Regina',
+  'UTC': 'UTC',
+  'GMT Standard Time': 'Europe/London',
+  'Romance Standard Time': 'Europe/Paris',
+  'W. Europe Standard Time': 'Europe/Berlin',
+  'Central European Standard Time': 'Europe/Warsaw',
+  'E. Europe Standard Time': 'Europe/Bucharest',
+  'FLE Standard Time': 'Europe/Helsinki',
+  'GTB Standard Time': 'Europe/Athens',
+  'Russian Standard Time': 'Europe/Moscow',
+  'Israel Standard Time': 'Asia/Jerusalem',
+  'Arabian Standard Time': 'Asia/Dubai',
+  'India Standard Time': 'Asia/Kolkata',
+  'China Standard Time': 'Asia/Shanghai',
+  'Tokyo Standard Time': 'Asia/Tokyo',
+  'Korea Standard Time': 'Asia/Seoul',
+  'AUS Eastern Standard Time': 'Australia/Sydney',
+  'New Zealand Standard Time': 'Pacific/Auckland',
+  'Singapore Standard Time': 'Asia/Singapore',
+  'SA Pacific Standard Time': 'America/Bogota',
+  'SA Eastern Standard Time': 'America/Buenos_Aires',
+  'E. South America Standard Time': 'America/Sao_Paulo',
+};
+
+function resolveTimezone(tzid) {
+  if (tzid.includes('/')) return tzid;
+  return WINDOWS_TZID_MAP[tzid] || null;
+}
+
 function parseICalDateTime(value, tzid) {
   // All-day: 20260315
   const dateOnly = value.match(/^(\d{4})(\d{2})(\d{2})$/);
@@ -210,7 +250,11 @@ function parseICalDateTime(value, tzid) {
     return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
   }
 
-  return localTimeToUTC(+y, +mo - 1, +d, +h, +mi, +s, tzid);
+  const resolved = resolveTimezone(tzid);
+  if (!resolved) {
+    return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+  }
+  return localTimeToUTC(+y, +mo - 1, +d, +h, +mi, +s, resolved);
 }
 
 function localTimeToUTC(y, mo, d, h, mi, s, tzid) {
@@ -224,10 +268,8 @@ function localTimeToUTC(y, mo, d, h, mi, s, tzid) {
 }
 
 function timesOverlap(a, b) {
-  const aStart = parseICalDateTime(a.fields['DTSTART'] || '', a.fields['DTSTART_TZID']);
-  const bStart = parseICalDateTime(b.fields['DTSTART'] || '', b.fields['DTSTART_TZID']);
-  if (aStart === null || bStart === null) return false;
-  return Math.abs(aStart - bStart) <= 5 * 60 * 1000;
+  if (a.startUTC === null || b.startUTC === null) return false;
+  return Math.abs(a.startUTC - b.startUTC) <= 5 * 60 * 1000;
 }
 
 function eventRichness(parsed) {
@@ -455,6 +497,26 @@ assert(parseICalDateTime('20260315') === Date.UTC(2026, 2, 15), 'parseICalDateTi
   const result = parseICalDateTime('20260315T100000Z', 'America/New_York');
   assert(result === Date.UTC(2026, 2, 15, 10, 0, 0), 'parseICalDateTime: Z suffix ignores TZID');
 }
+
+// parseICalDateTime with Windows timezone IDs (M365/Outlook)
+{
+  const result = parseICalDateTime('20260315T100000', 'Eastern Standard Time');
+  assert(result === Date.UTC(2026, 2, 15, 14, 0, 0), 'parseICalDateTime: Windows "Eastern Standard Time" converts to UTC');
+}
+{
+  const result = parseICalDateTime('20260315T100000', 'Pacific Standard Time');
+  assert(result === Date.UTC(2026, 2, 15, 17, 0, 0), 'parseICalDateTime: Windows "Pacific Standard Time" converts to UTC');
+}
+{
+  // Unknown timezone falls back to UTC
+  const result = parseICalDateTime('20260315T100000', 'Fake Timezone');
+  assert(result === Date.UTC(2026, 2, 15, 10, 0, 0), 'parseICalDateTime: unknown timezone falls back to UTC');
+}
+
+// resolveTimezone
+assert(resolveTimezone('America/Toronto') === 'America/Toronto', 'resolveTimezone: IANA passes through');
+assert(resolveTimezone('Eastern Standard Time') === 'America/New_York', 'resolveTimezone: Windows maps to IANA');
+assert(resolveTimezone('Fake Timezone') === null, 'resolveTimezone: unknown returns null');
 
 // parseEvent extracts TZID from parameters
 {

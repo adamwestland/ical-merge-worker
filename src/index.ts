@@ -58,6 +58,7 @@ interface ParsedEvent {
 	fields: Record<string, string>;    // DTSTART, SUMMARY, DESCRIPTION, etc.
 	feedId: string;
 	prefix?: string;
+	startUTC: number | null;           // pre-computed DTSTART in UTC ms
 }
 
 // ─── Entry Point ──────────────────────────────────────────────────────────────
@@ -611,7 +612,8 @@ function parseEvent(tagged: TaggedEvent): ParsedEvent {
 		}
 		fields[key] = line.slice(colonIdx + 1);
 	}
-	return { lines, fields, feedId: tagged.feedId, prefix: tagged.prefix };
+	const startUTC = parseICalDateTime(fields['DTSTART'] || '', fields['DTSTART_TZID']);
+	return { lines, fields, feedId: tagged.feedId, prefix: tagged.prefix, startUTC };
 }
 
 function normalizeTitle(summary: string): string {
@@ -656,6 +658,48 @@ function titlesMatch(a: string, b: string): boolean {
 	return diceCoefficient(na, nb) >= 0.75;
 }
 
+// Windows → IANA timezone mapping (M365/Outlook uses Windows IDs)
+const WINDOWS_TZID_MAP: Record<string, string> = {
+	'Eastern Standard Time': 'America/New_York',
+	'Central Standard Time': 'America/Chicago',
+	'Mountain Standard Time': 'America/Denver',
+	'Pacific Standard Time': 'America/Los_Angeles',
+	'Atlantic Standard Time': 'America/Halifax',
+	'Newfoundland Standard Time': 'America/St_Johns',
+	'Hawaiian Standard Time': 'Pacific/Honolulu',
+	'Alaskan Standard Time': 'America/Anchorage',
+	'US Mountain Standard Time': 'America/Phoenix',
+	'Canada Central Standard Time': 'America/Regina',
+	'UTC': 'UTC',
+	'GMT Standard Time': 'Europe/London',
+	'Romance Standard Time': 'Europe/Paris',
+	'W. Europe Standard Time': 'Europe/Berlin',
+	'Central European Standard Time': 'Europe/Warsaw',
+	'E. Europe Standard Time': 'Europe/Bucharest',
+	'FLE Standard Time': 'Europe/Helsinki',
+	'GTB Standard Time': 'Europe/Athens',
+	'Russian Standard Time': 'Europe/Moscow',
+	'Israel Standard Time': 'Asia/Jerusalem',
+	'Arabian Standard Time': 'Asia/Dubai',
+	'India Standard Time': 'Asia/Kolkata',
+	'China Standard Time': 'Asia/Shanghai',
+	'Tokyo Standard Time': 'Asia/Tokyo',
+	'Korea Standard Time': 'Asia/Seoul',
+	'AUS Eastern Standard Time': 'Australia/Sydney',
+	'New Zealand Standard Time': 'Pacific/Auckland',
+	'Singapore Standard Time': 'Asia/Singapore',
+	'SA Pacific Standard Time': 'America/Bogota',
+	'SA Eastern Standard Time': 'America/Buenos_Aires',
+	'E. South America Standard Time': 'America/Sao_Paulo',
+};
+
+function resolveTimezone(tzid: string): string | null {
+	// Already IANA (contains a slash)
+	if (tzid.includes('/')) return tzid;
+	// Windows timezone ID
+	return WINDOWS_TZID_MAP[tzid] || null;
+}
+
 function parseICalDateTime(value: string, tzid?: string): number | null {
 	// All-day: 20260315
 	const dateOnly = value.match(/^(\d{4})(\d{2})(\d{2})$/);
@@ -682,7 +726,12 @@ function parseICalDateTime(value: string, tzid?: string): number | null {
 		return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
 	}
 
-	return localTimeToUTC(+y, +mo - 1, +d, +h, +mi, +s, tzid);
+	const resolved = resolveTimezone(tzid);
+	if (!resolved) {
+		// Unknown timezone — treat as UTC rather than crashing
+		return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+	}
+	return localTimeToUTC(+y, +mo - 1, +d, +h, +mi, +s, resolved);
 }
 
 function localTimeToUTC(
@@ -700,10 +749,8 @@ function localTimeToUTC(
 }
 
 function timesOverlap(a: ParsedEvent, b: ParsedEvent): boolean {
-	const aStart = parseICalDateTime(a.fields['DTSTART'] || '', a.fields['DTSTART_TZID']);
-	const bStart = parseICalDateTime(b.fields['DTSTART'] || '', b.fields['DTSTART_TZID']);
-	if (aStart === null || bStart === null) return false;
-	return Math.abs(aStart - bStart) <= 5 * 60 * 1000; // 5 minutes
+	if (a.startUTC === null || b.startUTC === null) return false;
+	return Math.abs(a.startUTC - b.startUTC) <= 5 * 60 * 1000; // 5 minutes
 }
 
 function eventRichness(parsed: ParsedEvent): number {
