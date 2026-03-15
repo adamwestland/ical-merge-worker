@@ -42,6 +42,19 @@ interface ViewConfig {
 	calendarName: string;
 }
 
+interface TaggedEvent {
+	raw: string;        // VEVENT block (no prefix)
+	feedId: string;
+	prefix?: string;
+}
+
+interface ParsedEvent {
+	lines: string[];                   // raw VEVENT lines
+	fields: Record<string, string>;    // DTSTART, SUMMARY, DESCRIPTION, etc.
+	feedId: string;
+	prefix?: string;
+}
+
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 
 export default {
@@ -192,22 +205,27 @@ async function mergeFeeds(feeds: FeedConfig[], calendarName: string): Promise<st
 		feeds.map(feed => fetchFeed(feed))
 	);
 
-	const allEvents: string[] = [];
+	const taggedEvents: TaggedEvent[] = [];
 
 	for (let i = 0; i < results.length; i++) {
 		const result = results[i];
 		const feed = feeds[i];
 
 		if (result.status === 'fulfilled') {
-			const events = extractEvents(result.value, feed.prefix);
-			allEvents.push(...events);
+			const events = extractEvents(result.value);
+			for (const raw of events) {
+				taggedEvents.push({ raw, feedId: feed.id, prefix: feed.prefix });
+			}
 			console.log(`✓ ${feed.name}: ${events.length} events`);
 		} else {
 			console.error(`✗ ${feed.name}: ${result.reason}`);
 		}
 	}
 
-	return buildCalendar(calendarName, allEvents);
+	const deduped = deduplicateEvents(taggedEvents);
+	const serialized = deduped.map(e => serializeEvent(e));
+
+	return buildCalendar(calendarName, serialized);
 }
 
 async function fetchFeed(feed: FeedConfig): Promise<string> {
@@ -271,6 +289,162 @@ function prefixSummary(lines: string[], prefix: string): string[] {
 		}
 		return line;
 	});
+}
+
+// ─── Deduplication ────────────────────────────────────────────────────────────
+
+function parseEvent(tagged: TaggedEvent): ParsedEvent {
+	const lines = tagged.raw.split(/\r?\n/);
+	const fields: Record<string, string> = {};
+	for (const line of lines) {
+		const colonIdx = line.indexOf(':');
+		if (colonIdx === -1) continue;
+		let key = line.slice(0, colonIdx);
+		// Strip parameters (e.g. DTSTART;TZID=... → DTSTART)
+		const semiIdx = key.indexOf(';');
+		if (semiIdx !== -1) key = key.slice(0, semiIdx);
+		fields[key] = line.slice(colonIdx + 1);
+	}
+	return { lines, fields, feedId: tagged.feedId, prefix: tagged.prefix };
+}
+
+function normalizeTitle(summary: string): string {
+	return summary
+		.toLowerCase()
+		.replace(/[^\w\s]/g, '')  // strip punctuation
+		.replace(/\b(to|from|the|a|an)\b/g, '') // filler words
+		.replace(/\s+/g, ' ')
+		.trim();
+}
+
+function diceCoefficient(a: string, b: string): number {
+	if (a === b) return 1.0;
+	if (a.length < 2 || b.length < 2) return 0.0;
+
+	const bigrams = (s: string): Map<string, number> => {
+		const map = new Map<string, number>();
+		for (let i = 0; i < s.length - 1; i++) {
+			const bi = s.slice(i, i + 2);
+			map.set(bi, (map.get(bi) || 0) + 1);
+		}
+		return map;
+	};
+
+	const aBi = bigrams(a);
+	const bBi = bigrams(b);
+	let intersection = 0;
+
+	for (const [bi, count] of aBi) {
+		intersection += Math.min(count, bBi.get(bi) || 0);
+	}
+
+	return (2.0 * intersection) / (a.length - 1 + b.length - 1);
+}
+
+function titlesMatch(a: string, b: string): boolean {
+	const na = normalizeTitle(a);
+	const nb = normalizeTitle(b);
+
+	if (na === nb) return true;
+	if (na.includes(nb) || nb.includes(na)) return true;
+	return diceCoefficient(na, nb) >= 0.75;
+}
+
+function parseICalDateTime(value: string): number | null {
+	// Handles: 20260315T100000Z or 20260315T100000
+	const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/);
+	if (!match) return null;
+	const [, y, mo, d, h, mi, s] = match;
+	return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+}
+
+function timesOverlap(a: ParsedEvent, b: ParsedEvent): boolean {
+	const aStart = parseICalDateTime(a.fields['DTSTART'] || '');
+	const bStart = parseICalDateTime(b.fields['DTSTART'] || '');
+	if (aStart === null || bStart === null) return false;
+	return Math.abs(aStart - bStart) <= 5 * 60 * 1000; // 5 minutes
+}
+
+function eventRichness(parsed: ParsedEvent): number {
+	let score = 0;
+	const richFields = ['DESCRIPTION', 'LOCATION', 'GEO', 'URL', 'ATTENDEE', 'ORGANIZER'];
+	for (const f of richFields) {
+		if (parsed.fields[f]) score++;
+	}
+	score += (parsed.fields['DESCRIPTION'] || '').length;
+	return score;
+}
+
+function mergeEvents(a: ParsedEvent, b: ParsedEvent): ParsedEvent {
+	const aScore = eventRichness(a);
+	const bScore = eventRichness(b);
+	const primary = aScore >= bScore ? a : b;
+	const secondary = aScore >= bScore ? b : a;
+
+	const primaryKeys = new Set(primary.lines.map(line => {
+		const colonIdx = line.indexOf(':');
+		if (colonIdx === -1) return line;
+		let key = line.slice(0, colonIdx);
+		const semiIdx = key.indexOf(';');
+		if (semiIdx !== -1) key = key.slice(0, semiIdx);
+		return key;
+	}));
+
+	const newLines = [...primary.lines];
+	const insertIdx = newLines.findIndex(l => l === 'END:VEVENT');
+
+	for (const line of secondary.lines) {
+		if (line === 'BEGIN:VEVENT' || line === 'END:VEVENT') continue;
+		const colonIdx = line.indexOf(':');
+		if (colonIdx === -1) continue;
+		let key = line.slice(0, colonIdx);
+		const semiIdx = key.indexOf(';');
+		if (semiIdx !== -1) key = key.slice(0, semiIdx);
+		// Skip UID/DTSTAMP from secondary, and anything primary already has
+		if (key === 'UID' || key === 'DTSTAMP') continue;
+		if (!primaryKeys.has(key)) {
+			newLines.splice(insertIdx, 0, line);
+			primaryKeys.add(key);
+		}
+	}
+
+	return {
+		lines: newLines,
+		fields: { ...secondary.fields, ...primary.fields },
+		feedId: primary.feedId,
+		prefix: primary.prefix,
+	};
+}
+
+function deduplicateEvents(tagged: TaggedEvent[]): ParsedEvent[] {
+	const parsed = tagged.map(t => parseEvent(t));
+	const merged = new Array(parsed.length).fill(false); // track which indices were merged away
+
+	for (let i = 0; i < parsed.length; i++) {
+		if (merged[i]) continue;
+		// Skip recurring events
+		if (parsed[i].fields['RRULE']) continue;
+
+		for (let j = i + 1; j < parsed.length; j++) {
+			if (merged[j]) continue;
+			if (parsed[j].fields['RRULE']) continue;
+			// Never dedup events from the same feed
+			if (parsed[i].feedId === parsed[j].feedId) continue;
+
+			if (timesOverlap(parsed[i], parsed[j]) &&
+				titlesMatch(parsed[i].fields['SUMMARY'] || '', parsed[j].fields['SUMMARY'] || '')) {
+				parsed[i] = mergeEvents(parsed[i], parsed[j]);
+				merged[j] = true;
+			}
+		}
+	}
+
+	return parsed.filter((_, idx) => !merged[idx]);
+}
+
+function serializeEvent(parsed: ParsedEvent): string {
+	const lines = parsed.prefix ? prefixSummary(parsed.lines, parsed.prefix) : parsed.lines;
+	return lines.join('\r\n');
 }
 
 function buildCalendar(name: string, events: string[]): string {
