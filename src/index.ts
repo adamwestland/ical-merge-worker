@@ -11,22 +11,26 @@
  *   - Timing-safe token comparison (prevents timing attacks)
  *   - Rate limiting via CF Cache (prevents brute-force token guessing)
  *   - Emoji prefixes per feed so the source is obvious at a glance
+ *   - Web UI for toggling feeds on/off per view
  *
  * Usage:
  *   GET /calendar.ics?token=JULIES_TOKEN&view=julie
  *   GET /calendar.ics?token=ADAMS_TOKEN&view=full
  *   GET /calendar.ics?token=ADAMS_TOKEN               (defaults to "full" view)
+ *   GET /settings?token=X&view=julie                   (feed toggle UI)
  *
  * Environment Variables (set in wrangler.toml or via `wrangler secret put`):
  *   CALENDAR_FEEDS    – JSON array of feed configs, each with a unique `id`
  *   VIEWS             – JSON object mapping view names to { token, feeds[], calendarName }
  *   CACHE_TTL_SECONDS – How long to cache the merged result (default: 900 = 15 min)
+ *   SETTINGS          – KV namespace for per-view feed overrides
  */
 
 export interface Env {
 	CALENDAR_FEEDS: string;
 	VIEWS: string;
 	CACHE_TTL_SECONDS?: string;
+	SETTINGS: KVNamespace;
 }
 
 interface FeedConfig {
@@ -66,14 +70,7 @@ export default {
 			return new Response('ok', { status: 200 });
 		}
 
-		// Only serve on /calendar.ics
-		if (url.pathname !== '/calendar.ics') {
-			return new Response('Not found. Use /calendar.ics', { status: 404 });
-		}
-
 		// ── Rate Limiting ─────────────────────────────────────────────────────
-		// 30 requests per 60 seconds per IP — generous for calendar
-		// polling, brutal for brute-force guessing a 256-bit token.
 		const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
 		const rateLimitResult = await checkRateLimit(clientIP, 30, 60);
 		if (!rateLimitResult.allowed) {
@@ -83,64 +80,296 @@ export default {
 			});
 		}
 
-		// ── Parse views & feeds ───────────────────────────────────────────────
-		const allFeeds: FeedConfig[] = JSON.parse(env.CALENDAR_FEEDS);
-		const views: Record<string, ViewConfig> = JSON.parse(env.VIEWS);
-
-		// ── Resolve view ──────────────────────────────────────────────────────
-		const viewName = url.searchParams.get('view') || 'full';
-		const token = url.searchParams.get('token') || '';
-
-		// ── Auth ──────────────────────────────────────────────────────────────
-		// Try to authenticate against the requested view.
-		// If the view doesn't exist, compare against a dummy token to avoid
-		// leaking which view names are valid via response timing.
-		const dummyToken = 'x'.repeat(64);
-		const expectedToken = views[viewName]?.token || dummyToken;
-		const tokenValid = timingSafeEqual(token, expectedToken);
-		const viewExists = viewName in views;
-
-		if (!tokenValid || !viewExists) {
-			return new Response('Unauthorized', { status: 401 });
+		// ── Route ─────────────────────────────────────────────────────────────
+		switch (url.pathname) {
+			case '/calendar.ics':
+				return handleCalendar(request, url, env, ctx);
+			case '/settings':
+				return handleSettingsPage(url, env);
+			case '/api/feeds':
+				return handleFeedsApi(request, url, env);
+			default:
+				return new Response('Not found', { status: 404 });
 		}
-
-		const view = views[viewName];
-
-		// ── Cache layer ───────────────────────────────────────────────────────
-		// Cache key includes the full URL (with view param) so views cache separately
-		const cacheKey = new Request(url.toString(), request);
-		const cache = caches.default;
-		const cachedResponse = await cache.match(cacheKey);
-		if (cachedResponse) {
-			return cachedResponse;
-		}
-
-		// ── Filter feeds for this view ────────────────────────────────────────
-		const feedIds = new Set(view.feeds);
-		const viewFeeds = allFeeds.filter(f => feedIds.has(f.id));
-
-		if (viewFeeds.length === 0) {
-			return new Response('No feeds configured for this view', { status: 500 });
-		}
-
-		// ── Fetch & merge ─────────────────────────────────────────────────────
-		const ttl = parseInt(env.CACHE_TTL_SECONDS || '900', 10);
-		const mergedIcal = await mergeFeeds(viewFeeds, view.calendarName);
-
-		const response = new Response(mergedIcal, {
-			status: 200,
-			headers: {
-				'Content-Type': 'text/calendar; charset=utf-8',
-				'Content-Disposition': `inline; filename="${viewName}.ics"`,
-				'Cache-Control': `public, max-age=${ttl}`,
-			},
-		});
-
-		ctx.waitUntil(cache.put(cacheKey, response.clone()));
-
-		return response;
 	},
 };
+
+// ─── Auth Helper ──────────────────────────────────────────────────────────────
+
+function authenticateView(
+	url: URL,
+	env: Env
+): { view: ViewConfig; viewName: string } | null {
+	const views: Record<string, ViewConfig> = JSON.parse(env.VIEWS);
+	const viewName = url.searchParams.get('view') || 'full';
+	const token = url.searchParams.get('token') || '';
+
+	const dummyToken = 'x'.repeat(64);
+	const expectedToken = views[viewName]?.token || dummyToken;
+	const tokenValid = timingSafeEqual(token, expectedToken);
+	const viewExists = viewName in views;
+
+	if (!tokenValid || !viewExists) {
+		return null;
+	}
+
+	return { view: views[viewName], viewName };
+}
+
+// ─── Calendar Route ───────────────────────────────────────────────────────────
+
+async function handleCalendar(
+	request: Request,
+	url: URL,
+	env: Env,
+	ctx: ExecutionContext
+): Promise<Response> {
+	const auth = authenticateView(url, env);
+	if (!auth) {
+		return new Response('Unauthorized', { status: 401 });
+	}
+
+	const { view, viewName } = auth;
+
+	// ── Cache layer ───────────────────────────────────────────────────────
+	const cacheKey = new Request(url.toString(), request);
+	const cache = caches.default;
+	const cachedResponse = await cache.match(cacheKey);
+	if (cachedResponse) {
+		return cachedResponse;
+	}
+
+	// ── Filter feeds for this view (KV override → VIEWS fallback) ─────────
+	const allFeeds: FeedConfig[] = JSON.parse(env.CALENDAR_FEEDS);
+	const kvFeeds = await env.SETTINGS.get(`view:${viewName}:feeds`);
+	const feedIds = new Set(kvFeeds ? JSON.parse(kvFeeds) : view.feeds);
+	const viewFeeds = allFeeds.filter(f => feedIds.has(f.id));
+
+	if (viewFeeds.length === 0) {
+		return new Response('No feeds configured for this view', { status: 500 });
+	}
+
+	// ── Fetch & merge ─────────────────────────────────────────────────────
+	const ttl = parseInt(env.CACHE_TTL_SECONDS || '900', 10);
+	const mergedIcal = await mergeFeeds(viewFeeds, view.calendarName);
+
+	const response = new Response(mergedIcal, {
+		status: 200,
+		headers: {
+			'Content-Type': 'text/calendar; charset=utf-8',
+			'Content-Disposition': `inline; filename="${viewName}.ics"`,
+			'Cache-Control': `public, max-age=${ttl}`,
+		},
+	});
+
+	ctx.waitUntil(cache.put(cacheKey, response.clone()));
+
+	return response;
+}
+
+// ─── Settings Page ────────────────────────────────────────────────────────────
+
+async function handleSettingsPage(url: URL, env: Env): Promise<Response> {
+	const auth = authenticateView(url, env);
+	if (!auth) {
+		return new Response('Unauthorized', { status: 401 });
+	}
+
+	const { view, viewName } = auth;
+	const token = url.searchParams.get('token') || '';
+
+	const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feed Settings – ${escapeHtml(view.calendarName)}</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#fff;--fg:#111;--muted:#666;--border:#e0e0e0;--card:#f8f8f8;--accent:#2563eb;--accent-fg:#fff;--success:#16a34a;--error:#dc2626;--toggle-bg:#ccc;--toggle-on:#2563eb}
+@media(prefers-color-scheme:dark){:root{--bg:#111;--fg:#f0f0f0;--muted:#999;--border:#333;--card:#1a1a1a;--accent:#3b82f6;--toggle-bg:#444;--toggle-on:#3b82f6}}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg);max-width:480px;margin:0 auto;padding:16px 16px 100px}
+h1{font-size:1.25rem;margin-bottom:2px}
+.subtitle{color:var(--muted);font-size:.875rem;margin-bottom:24px}
+.feed-list{list-style:none}
+.feed-item{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid var(--border)}
+.feed-info{display:flex;align-items:center;gap:10px}
+.feed-prefix{font-size:1.25rem;width:28px;text-align:center}
+.feed-name{font-size:1rem}
+.toggle{position:relative;width:52px;height:30px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .slider{position:absolute;inset:0;background:var(--toggle-bg);border-radius:15px;cursor:pointer;transition:background .2s}
+.toggle .slider::before{content:'';position:absolute;width:24px;height:24px;left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+.toggle input:checked+.slider{background:var(--toggle-on)}
+.toggle input:checked+.slider::before{transform:translateX(22px)}
+.save-bar{position:fixed;bottom:0;left:0;right:0;padding:16px;background:var(--bg);border-top:1px solid var(--border)}
+.save-bar-inner{max-width:480px;margin:0 auto}
+.save-btn{width:100%;padding:14px;font-size:1rem;font-weight:600;border:none;border-radius:10px;background:var(--accent);color:var(--accent-fg);cursor:pointer;min-height:48px}
+.save-btn:disabled{opacity:.5;cursor:not-allowed}
+.toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);padding:10px 20px;border-radius:8px;font-size:.875rem;font-weight:500;opacity:0;transition:opacity .3s;pointer-events:none;z-index:10}
+.toast.success{background:var(--success);color:#fff}
+.toast.error{background:var(--error);color:#fff}
+.toast.show{opacity:1}
+.loading{text-align:center;padding:40px;color:var(--muted)}
+</style>
+</head>
+<body>
+<h1>${escapeHtml(viewName)}</h1>
+<p class="subtitle">${escapeHtml(view.calendarName)}</p>
+<div id="content"><p class="loading">Loading feeds…</p></div>
+<div class="save-bar"><div class="save-bar-inner">
+<button class="save-btn" id="saveBtn" disabled>Save</button>
+</div></div>
+<div class="toast" id="toast"></div>
+<script>
+const TOKEN = ${JSON.stringify(token)};
+const VIEW = ${JSON.stringify(viewName)};
+const qs = 'token=' + encodeURIComponent(TOKEN) + '&view=' + encodeURIComponent(VIEW);
+let feeds = [];
+
+async function load() {
+  try {
+    const res = await fetch('/api/feeds?' + qs);
+    if (!res.ok) throw new Error('Failed to load');
+    const data = await res.json();
+    feeds = data.feeds;
+    render(data.feeds, data.enabled);
+  } catch (e) {
+    document.getElementById('content').innerHTML = '<p class="loading">Failed to load feeds.</p>';
+  }
+}
+
+function render(feeds, enabled) {
+  const set = new Set(enabled);
+  let html = '<ul class="feed-list">';
+  for (const f of feeds) {
+    html += '<li class="feed-item">'
+      + '<div class="feed-info">'
+      + '<span class="feed-prefix">' + esc(f.prefix || '') + '</span>'
+      + '<span class="feed-name">' + esc(f.name) + '</span>'
+      + '</div>'
+      + '<label class="toggle">'
+      + '<input type="checkbox" data-id="' + esc(f.id) + '"' + (set.has(f.id) ? ' checked' : '') + '>'
+      + '<span class="slider"></span>'
+      + '</label></li>';
+  }
+  html += '</ul>';
+  document.getElementById('content').innerHTML = html;
+  document.getElementById('saveBtn').disabled = false;
+  document.querySelectorAll('.toggle input').forEach(cb => cb.addEventListener('change', validate));
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function getEnabled() {
+  return [...document.querySelectorAll('.toggle input:checked')].map(cb => cb.dataset.id);
+}
+
+function validate() {
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = getEnabled().length === 0;
+}
+
+async function save() {
+  const btn = document.getElementById('saveBtn');
+  const enabled = getEnabled();
+  if (enabled.length === 0) return;
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const res = await fetch('/api/feeds?' + qs, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ feeds: enabled })
+    });
+    if (!res.ok) throw new Error('Save failed');
+    showToast('Saved! Changes take effect within 15 minutes.', 'success');
+  } catch (e) {
+    showToast('Failed to save. Try again.', 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save';
+  }
+}
+
+function showToast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast ' + type + ' show';
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+document.getElementById('saveBtn').addEventListener('click', save);
+load();
+</script>
+</body>
+</html>`;
+
+	return new Response(html, {
+		headers: { 'Content-Type': 'text/html; charset=utf-8' },
+	});
+}
+
+function escapeHtml(s: string): string {
+	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ─── Feeds API ────────────────────────────────────────────────────────────────
+
+async function handleFeedsApi(request: Request, url: URL, env: Env): Promise<Response> {
+	const auth = authenticateView(url, env);
+	if (!auth) {
+		return new Response('Unauthorized', { status: 401 });
+	}
+
+	const { view, viewName } = auth;
+	const allFeeds: FeedConfig[] = JSON.parse(env.CALENDAR_FEEDS);
+
+	if (request.method === 'GET') {
+		const kvFeeds = await env.SETTINGS.get(`view:${viewName}:feeds`);
+		const enabledIds: string[] = kvFeeds ? JSON.parse(kvFeeds) : view.feeds;
+
+		const feeds = allFeeds.map(f => ({
+			id: f.id,
+			name: f.name,
+			prefix: f.prefix || '',
+		}));
+
+		return Response.json({ feeds, enabled: enabledIds });
+	}
+
+	if (request.method === 'PUT') {
+		let body: { feeds?: unknown };
+		try {
+			body = await request.json();
+		} catch {
+			return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+		}
+
+		if (!Array.isArray(body.feeds) || body.feeds.length === 0) {
+			return Response.json({ error: 'feeds must be a non-empty array of strings' }, { status: 400 });
+		}
+
+		const validIds = new Set(allFeeds.map(f => f.id));
+		const requestedFeeds: string[] = [];
+		for (const id of body.feeds) {
+			if (typeof id !== 'string' || !validIds.has(id)) {
+				return Response.json({ error: `Invalid feed ID: ${id}` }, { status: 400 });
+			}
+			requestedFeeds.push(id);
+		}
+
+		await env.SETTINGS.put(`view:${viewName}:feeds`, JSON.stringify(requestedFeeds));
+
+		return Response.json({ ok: true, feeds: requestedFeeds });
+	}
+
+	return new Response('Method not allowed', { status: 405 });
+}
 
 // ─── Security Helpers ─────────────────────────────────────────────────────────
 

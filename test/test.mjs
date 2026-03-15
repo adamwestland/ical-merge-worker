@@ -47,6 +47,17 @@ function timingSafeEqual(a, b) {
   return mismatch === 0;
 }
 
+function authenticateView(url, views) {
+  const viewName = url.searchParams.get('view') || 'full';
+  const token = url.searchParams.get('token') || '';
+  const dummyToken = 'x'.repeat(64);
+  const expectedToken = views[viewName]?.token || dummyToken;
+  const tokenValid = timingSafeEqual(token, expectedToken);
+  const viewExists = viewName in views;
+  if (!tokenValid || !viewExists) return null;
+  return { view: views[viewName], viewName };
+}
+
 function resolveView(views, viewName, token) {
   const dummyToken = 'x'.repeat(64);
   const expectedToken = views[viewName]?.token || dummyToken;
@@ -215,6 +226,11 @@ function deduplicateEvents(tagged) {
 function serializeEvent(parsed) {
   const lines = parsed.prefix ? prefixSummary(parsed.lines, parsed.prefix) : parsed.lines;
   return lines.join('\r\n');
+}
+
+// Mirrors the KV fallback logic from handleCalendar
+function resolveEnabledFeeds(kvFeeds, viewFeeds) {
+  return kvFeeds ? JSON.parse(kvFeeds) : viewFeeds;
 }
 
 // ── Test Data ─────────────────────────────────────────────────────────────────
@@ -436,6 +452,61 @@ assert(parseICalDateTime('invalid') === null, 'parseICalDateTime: invalid return
 
   const result = deduplicateEvents(tagged);
   assert(result.length === 2, 'dedup: recurring events are skipped (not merged)');
+}
+
+// ── authenticateView tests ────────────────────────────────────────────────────
+
+{
+  const url1 = new URL('https://example.com/settings?token=abc123fulltoken&view=full');
+  const result1 = authenticateView(url1, views);
+  assert(result1 !== null && result1.viewName === 'full', 'authenticateView: valid full view returns result');
+  assert(result1 !== null && result1.view.calendarName === 'Adam (all)', 'authenticateView: returns correct view config');
+}
+
+{
+  const url2 = new URL('https://example.com/settings?token=xyz789julietoken&view=julie');
+  const result2 = authenticateView(url2, views);
+  assert(result2 !== null && result2.viewName === 'julie', 'authenticateView: valid julie view returns result');
+}
+
+{
+  const url3 = new URL('https://example.com/settings?token=wrongtoken&view=full');
+  assert(authenticateView(url3, views) === null, 'authenticateView: wrong token returns null');
+}
+
+{
+  const url4 = new URL('https://example.com/settings?token=abc123fulltoken&view=nonexistent');
+  assert(authenticateView(url4, views) === null, 'authenticateView: nonexistent view returns null');
+}
+
+{
+  const url5 = new URL('https://example.com/settings?token=abc123fulltoken');
+  const result5 = authenticateView(url5, views);
+  assert(result5 !== null && result5.viewName === 'full', 'authenticateView: defaults to full view when view param missing');
+}
+
+// ── KV fallback logic tests ───────────────────────────────────────────────────
+
+{
+  // When KV has an override, use it
+  const kvResult = resolveEnabledFeeds('["gmail","tripit"]', views.julie.feeds);
+  assert(kvResult.length === 2, 'KV fallback: uses KV override when present');
+  assert(kvResult[0] === 'gmail' && kvResult[1] === 'tripit', 'KV fallback: returns correct KV feed IDs');
+}
+
+{
+  // When KV is null, fall back to view config
+  const fallbackResult = resolveEnabledFeeds(null, views.julie.feeds);
+  assert(fallbackResult.length === 4, 'KV fallback: uses VIEWS feeds when KV is null');
+  assert(JSON.stringify(fallbackResult) === JSON.stringify(views.julie.feeds), 'KV fallback: returns exact VIEWS feed array');
+}
+
+{
+  // KV override filters feeds correctly
+  const kvFeeds = resolveEnabledFeeds('["gmail"]', views.full.feeds);
+  const filtered = filterFeeds(allFeeds, kvFeeds);
+  assert(filtered.length === 1, 'KV fallback: KV override correctly limits feed list');
+  assert(filtered[0].id === 'gmail', 'KV fallback: filtered feed matches KV selection');
 }
 
 // Summary
