@@ -47,23 +47,44 @@ function timingSafeEqual(a, b) {
   return mismatch === 0;
 }
 
-function authenticateView(url, views) {
+function loadFeedConfigs(feedMeta, feedUrls) {
+  return feedMeta.map(meta => ({
+    id: meta.id,
+    name: meta.name,
+    url: feedUrls[meta.id] || '',
+    prefix: meta.prefix,
+  }));
+}
+
+function loadViewConfig(viewName, viewConfigs, viewTokens) {
+  const token = viewTokens[viewName];
+  const config = viewConfigs[viewName];
+  if (!token || !config) return null;
+  return { token, feeds: config.feeds, calendarName: config.calendarName };
+}
+
+function authenticateView(url, viewConfigs, viewTokens) {
   const viewName = url.searchParams.get('view') || 'full';
   const token = url.searchParams.get('token') || '';
   const dummyToken = 'x'.repeat(64);
-  const expectedToken = views[viewName]?.token || dummyToken;
+  const expectedToken = viewTokens[viewName] || dummyToken;
   const tokenValid = timingSafeEqual(token, expectedToken);
-  const viewExists = viewName in views;
-  if (!tokenValid || !viewExists) return null;
-  return { view: views[viewName], viewName };
+  const tokenExists = viewName in viewTokens;
+  if (!tokenValid || !tokenExists) return null;
+  const config = viewConfigs[viewName];
+  if (!config) return null;
+  return {
+    view: { token: viewTokens[viewName], feeds: config.feeds, calendarName: config.calendarName },
+    viewName,
+  };
 }
 
-function resolveView(views, viewName, token) {
+function resolveView(viewTokens, viewName, token) {
   const dummyToken = 'x'.repeat(64);
-  const expectedToken = views[viewName]?.token || dummyToken;
+  const expectedToken = viewTokens[viewName] || dummyToken;
   const tokenValid = timingSafeEqual(token, expectedToken);
-  const viewExists = viewName in views;
-  return tokenValid && viewExists;
+  const tokenExists = viewName in viewTokens;
+  return tokenValid && tokenExists;
 }
 
 function filterFeeds(allFeeds, feedIds) {
@@ -80,15 +101,44 @@ function prefixSummary(lines, prefix) {
   });
 }
 
+function extractTimezones(icalText) {
+  const unfolded = icalText.replace(/\r?\n[ \t]/g, '');
+  const timezones = [];
+  const lines = unfolded.split(/\r?\n/);
+  let inTZ = false;
+  let tzLines = [];
+  for (const line of lines) {
+    if (line === 'BEGIN:VTIMEZONE') {
+      inTZ = true;
+      tzLines = [line];
+    } else if (line === 'END:VTIMEZONE' && inTZ) {
+      tzLines.push(line);
+      inTZ = false;
+      timezones.push(tzLines.join('\r\n'));
+    } else if (inTZ) {
+      tzLines.push(line);
+    }
+  }
+  return timezones;
+}
+
 function parseEvent(tagged) {
   const lines = tagged.raw.split(/\r?\n/);
   const fields = {};
   for (const line of lines) {
     const colonIdx = line.indexOf(':');
     if (colonIdx === -1) continue;
-    let key = line.slice(0, colonIdx);
+    const fullKey = line.slice(0, colonIdx);
+    let key = fullKey;
     const semiIdx = key.indexOf(';');
-    if (semiIdx !== -1) key = key.slice(0, semiIdx);
+    if (semiIdx !== -1) {
+      const params = fullKey.slice(semiIdx + 1);
+      key = key.slice(0, semiIdx);
+      const tzMatch = params.match(/TZID=([^;]+)/);
+      if (tzMatch) {
+        fields[key + '_TZID'] = tzMatch[1];
+      }
+    }
     fields[key] = line.slice(colonIdx + 1);
   }
   return { lines, fields, feedId: tagged.feedId, prefix: tagged.prefix };
@@ -135,16 +185,47 @@ function titlesMatch(a, b) {
   return diceCoefficient(na, nb) >= 0.75;
 }
 
-function parseICalDateTime(value) {
-  const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/);
+function parseICalDateTime(value, tzid) {
+  // All-day: 20260315
+  const dateOnly = value.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (dateOnly) {
+    const [, y, mo, d] = dateOnly;
+    return Date.UTC(+y, +mo - 1, +d);
+  }
+
+  // DateTime with Z — already UTC
+  if (value.endsWith('Z')) {
+    const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+    if (!match) return null;
+    const [, y, mo, d, h, mi, s] = match;
+    return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+  }
+
+  // DateTime without Z — local time, optionally with TZID
+  const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/);
   if (!match) return null;
   const [, y, mo, d, h, mi, s] = match;
-  return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+
+  if (!tzid) {
+    return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+  }
+
+  return localTimeToUTC(+y, +mo - 1, +d, +h, +mi, +s, tzid);
+}
+
+function localTimeToUTC(y, mo, d, h, mi, s, tzid) {
+  const guessUTC = Date.UTC(y, mo, d, h, mi, s);
+  const localStr = new Date(guessUTC).toLocaleString('sv-SE', { timeZone: tzid });
+  const [datePart, timePart] = localStr.split(' ');
+  const [ly, lmo, ld] = datePart.split('-').map(Number);
+  const [lh, lmi, ls] = timePart.split(':').map(Number);
+  const localAsUTC = Date.UTC(ly, lmo - 1, ld, lh, lmi, ls);
+  return guessUTC - (localAsUTC - guessUTC);
 }
 
 function timesOverlap(a, b) {
-  const aStart = parseICalDateTime(a.fields['DTSTART'] || '');
-  const bStart = parseICalDateTime(b.fields['DTSTART'] || '');
+  const aStart = parseICalDateTime(a.fields['DTSTART'] || '', a.fields['DTSTART_TZID']);
+  const bStart = parseICalDateTime(b.fields['DTSTART'] || '', b.fields['DTSTART_TZID']);
   if (aStart === null || bStart === null) return false;
   return Math.abs(aStart - bStart) <= 5 * 60 * 1000;
 }
@@ -253,25 +334,44 @@ UID:def456@test.com
 END:VEVENT
 END:VCALENDAR`;
 
-const allFeeds = [
-  { id: 'gmail',    name: 'Gmail',    url: 'https://example.com/1', prefix: '📧' },
-  { id: 'work',     name: 'Work',     url: 'https://example.com/2', prefix: '🏢' },
-  { id: 'personal', name: 'Personal', url: 'https://example.com/3', prefix: '👤' },
-  { id: 'tripit',   name: 'TripIt',   url: 'https://example.com/4', prefix: '✈️' },
-  { id: 'f1',       name: 'F1',       url: 'https://example.com/5', prefix: '🏎️' },
+// Split data: secrets vs KV config (mirrors new architecture)
+const feedMeta = [
+  { id: 'gmail',    name: 'Gmail',    prefix: '📧' },
+  { id: 'work',     name: 'Work',     prefix: '🏢' },
+  { id: 'personal', name: 'Personal', prefix: '👤' },
+  { id: 'tripit',   name: 'TripIt',   prefix: '✈️' },
+  { id: 'f1',       name: 'F1',       prefix: '🏎️' },
 ];
 
-const views = {
+const feedUrls = {
+  gmail: 'https://example.com/1',
+  work: 'https://example.com/2',
+  personal: 'https://example.com/3',
+  tripit: 'https://example.com/4',
+  f1: 'https://example.com/5',
+};
+
+const viewTokens = {
+  full: 'abc123fulltoken',
+  julie: 'xyz789julietoken',
+};
+
+const viewConfigs = {
   full: {
-    token: 'abc123fulltoken',
     feeds: ['gmail', 'work', 'personal', 'tripit', 'f1'],
     calendarName: 'Adam (all)',
   },
   julie: {
-    token: 'xyz789julietoken',
     feeds: ['gmail', 'personal', 'tripit', 'f1'],
     calendarName: "Adam's Schedule",
   },
+};
+
+// Derived (same shape as original, for existing tests)
+const allFeeds = loadFeedConfigs(feedMeta, feedUrls);
+const views = {
+  full: loadViewConfig('full', viewConfigs, viewTokens),
+  julie: loadViewConfig('julie', viewConfigs, viewTokens),
 };
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -305,12 +405,12 @@ assert(timingSafeEqual('', '') === true, 'Empty strings match');
 assert(timingSafeEqual('a', '') === false, 'Empty vs non-empty rejects');
 
 // View resolution
-assert(resolveView(views, 'full', 'abc123fulltoken') === true, 'Valid view + token passes');
-assert(resolveView(views, 'julie', 'xyz789julietoken') === true, 'Julie view + token passes');
-assert(resolveView(views, 'full', 'wrongtoken') === false, 'Wrong token rejects');
-assert(resolveView(views, 'julie', 'abc123fulltoken') === false, 'Cross-view token rejects');
-assert(resolveView(views, 'nonexistent', 'abc123fulltoken') === false, 'Nonexistent view rejects');
-assert(resolveView(views, 'full', '') === false, 'Empty token rejects');
+assert(resolveView(viewTokens, 'full', 'abc123fulltoken') === true, 'Valid view + token passes');
+assert(resolveView(viewTokens, 'julie', 'xyz789julietoken') === true, 'Julie view + token passes');
+assert(resolveView(viewTokens, 'full', 'wrongtoken') === false, 'Wrong token rejects');
+assert(resolveView(viewTokens, 'julie', 'abc123fulltoken') === false, 'Cross-view token rejects');
+assert(resolveView(viewTokens, 'nonexistent', 'abc123fulltoken') === false, 'Nonexistent view rejects');
+assert(resolveView(viewTokens, 'full', '') === false, 'Empty token rejects');
 
 // Feed filtering
 assert(filterFeeds(allFeeds, views.full.feeds).length === 5, 'Full view gets all 5 feeds');
@@ -335,8 +435,45 @@ assert(titlesMatch('Dentist Appointment', 'Flight to SFO') === false, 'titlesMat
 
 // parseICalDateTime
 assert(parseICalDateTime('20260315T100000Z') === Date.UTC(2026, 2, 15, 10, 0, 0), 'parseICalDateTime: with Z');
-assert(parseICalDateTime('20260315T100000') === Date.UTC(2026, 2, 15, 10, 0, 0), 'parseICalDateTime: without Z');
+assert(parseICalDateTime('20260315T100000') === Date.UTC(2026, 2, 15, 10, 0, 0), 'parseICalDateTime: without Z (no TZID, treated as UTC)');
 assert(parseICalDateTime('invalid') === null, 'parseICalDateTime: invalid returns null');
+assert(parseICalDateTime('20260315') === Date.UTC(2026, 2, 15), 'parseICalDateTime: date-only (all-day event)');
+
+// parseICalDateTime with TZID
+{
+  // 10:00 AM in New York (EDT, UTC-4) = 14:00 UTC
+  const result = parseICalDateTime('20260315T100000', 'America/New_York');
+  assert(result === Date.UTC(2026, 2, 15, 14, 0, 0), 'parseICalDateTime: TZID America/New_York converts to UTC');
+}
+{
+  // 10:00 AM in Toronto (EDT, UTC-4) = 14:00 UTC (same as New York)
+  const result = parseICalDateTime('20260315T100000', 'America/Toronto');
+  assert(result === Date.UTC(2026, 2, 15, 14, 0, 0), 'parseICalDateTime: TZID America/Toronto converts to UTC');
+}
+{
+  // Z suffix ignores TZID — already UTC
+  const result = parseICalDateTime('20260315T100000Z', 'America/New_York');
+  assert(result === Date.UTC(2026, 2, 15, 10, 0, 0), 'parseICalDateTime: Z suffix ignores TZID');
+}
+
+// parseEvent extracts TZID from parameters
+{
+  const tagged = {
+    raw: 'BEGIN:VEVENT\r\nDTSTART;TZID=America/Toronto:20260315T100000\r\nSUMMARY:Meeting\r\nEND:VEVENT',
+    feedId: 'work',
+  };
+  const parsed = parseEvent(tagged);
+  assert(parsed.fields['DTSTART'] === '20260315T100000', 'parseEvent: extracts DTSTART value');
+  assert(parsed.fields['DTSTART_TZID'] === 'America/Toronto', 'parseEvent: extracts DTSTART_TZID');
+}
+{
+  const tagged = {
+    raw: 'BEGIN:VEVENT\r\nDTSTART:20260315T100000Z\r\nSUMMARY:Meeting\r\nEND:VEVENT',
+    feedId: 'work',
+  };
+  const parsed = parseEvent(tagged);
+  assert(parsed.fields['DTSTART_TZID'] === undefined, 'parseEvent: no TZID when not present');
+}
 
 // deduplicateEvents — merges duplicates into 1 with richer fields
 {
@@ -458,30 +595,30 @@ assert(parseICalDateTime('invalid') === null, 'parseICalDateTime: invalid return
 
 {
   const url1 = new URL('https://example.com/settings?token=abc123fulltoken&view=full');
-  const result1 = authenticateView(url1, views);
+  const result1 = authenticateView(url1, viewConfigs, viewTokens);
   assert(result1 !== null && result1.viewName === 'full', 'authenticateView: valid full view returns result');
   assert(result1 !== null && result1.view.calendarName === 'Adam (all)', 'authenticateView: returns correct view config');
 }
 
 {
   const url2 = new URL('https://example.com/settings?token=xyz789julietoken&view=julie');
-  const result2 = authenticateView(url2, views);
+  const result2 = authenticateView(url2, viewConfigs, viewTokens);
   assert(result2 !== null && result2.viewName === 'julie', 'authenticateView: valid julie view returns result');
 }
 
 {
   const url3 = new URL('https://example.com/settings?token=wrongtoken&view=full');
-  assert(authenticateView(url3, views) === null, 'authenticateView: wrong token returns null');
+  assert(authenticateView(url3, viewConfigs, viewTokens) === null, 'authenticateView: wrong token returns null');
 }
 
 {
   const url4 = new URL('https://example.com/settings?token=abc123fulltoken&view=nonexistent');
-  assert(authenticateView(url4, views) === null, 'authenticateView: nonexistent view returns null');
+  assert(authenticateView(url4, viewConfigs, viewTokens) === null, 'authenticateView: nonexistent view returns null');
 }
 
 {
   const url5 = new URL('https://example.com/settings?token=abc123fulltoken');
-  const result5 = authenticateView(url5, views);
+  const result5 = authenticateView(url5, viewConfigs, viewTokens);
   assert(result5 !== null && result5.viewName === 'full', 'authenticateView: defaults to full view when view param missing');
 }
 
@@ -507,6 +644,140 @@ assert(parseICalDateTime('invalid') === null, 'parseICalDateTime: invalid return
   const filtered = filterFeeds(allFeeds, kvFeeds);
   assert(filtered.length === 1, 'KV fallback: KV override correctly limits feed list');
   assert(filtered[0].id === 'gmail', 'KV fallback: filtered feed matches KV selection');
+}
+
+// deduplicateEvents — cross-timezone dedup (UTC vs TZID)
+{
+  // TripIt sends UTC: 14:00Z, Outlook sends local: 10:00 America/Toronto (= 14:00 UTC)
+  const utcEvent = [
+    'BEGIN:VEVENT',
+    'DTSTART:20260315T140000Z',
+    'SUMMARY:Flight to SFO',
+    'DESCRIPTION:Confirmation ABC123',
+    'UID:tripit-tz@tripit.com',
+    'END:VEVENT',
+  ].join('\r\n');
+
+  const tzEvent = [
+    'BEGIN:VEVENT',
+    'DTSTART;TZID=America/Toronto:20260315T100000',
+    'SUMMARY:Flight to SFO',
+    'UID:outlook-tz@outlook.com',
+    'END:VEVENT',
+  ].join('\r\n');
+
+  const tagged = [
+    { raw: utcEvent, feedId: 'tripit', prefix: '✈️' },
+    { raw: tzEvent, feedId: 'personal', prefix: '👤' },
+  ];
+
+  const result = deduplicateEvents(tagged);
+  assert(result.length === 1, 'dedup: UTC vs TZID same time merges to 1');
+}
+
+// deduplicateEvents — different times in different timezones should NOT merge
+{
+  const event1 = [
+    'BEGIN:VEVENT',
+    'DTSTART:20260315T100000Z',
+    'SUMMARY:Team Standup',
+    'UID:e1-tz@test.com',
+    'END:VEVENT',
+  ].join('\r\n');
+
+  const event2 = [
+    'BEGIN:VEVENT',
+    'DTSTART;TZID=America/Toronto:20260315T100000',
+    'SUMMARY:Team Standup',
+    'UID:e2-tz@test.com',
+    'END:VEVENT',
+  ].join('\r\n');
+
+  const tagged = [
+    { raw: event1, feedId: 'work', prefix: '🏢' },
+    { raw: event2, feedId: 'personal', prefix: '👤' },
+  ];
+
+  // 10:00 UTC vs 10:00 Toronto (14:00 UTC) = 4 hours apart, should NOT merge
+  const result = deduplicateEvents(tagged);
+  assert(result.length === 2, 'dedup: same local time different actual time stays separate');
+}
+
+// ── extractTimezones tests ─────────────────────────────────────────────────────
+
+{
+  const ical = `BEGIN:VCALENDAR
+BEGIN:VTIMEZONE
+TZID:America/Toronto
+BEGIN:STANDARD
+DTSTART:19701101T020000
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:19700308T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+END:VTIMEZONE
+BEGIN:VEVENT
+DTSTART;TZID=America/Toronto:20260315T100000
+SUMMARY:Test
+END:VEVENT
+END:VCALENDAR`;
+
+  const tzs = extractTimezones(ical);
+  assert(tzs.length === 1, 'extractTimezones: extracts 1 VTIMEZONE block');
+  assert(tzs[0].includes('TZID:America/Toronto'), 'extractTimezones: contains correct TZID');
+  assert(tzs[0].startsWith('BEGIN:VTIMEZONE'), 'extractTimezones: starts with BEGIN');
+  assert(tzs[0].endsWith('END:VTIMEZONE'), 'extractTimezones: ends with END');
+}
+
+{
+  const ical = 'BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:No TZ\nEND:VEVENT\nEND:VCALENDAR';
+  assert(extractTimezones(ical).length === 0, 'extractTimezones: returns empty for no timezones');
+}
+
+// ── loadFeedConfigs tests ──────────────────────────────────────────────────────
+
+{
+  const result = loadFeedConfigs(feedMeta, feedUrls);
+  assert(result.length === 5, 'loadFeedConfigs: returns all 5 feeds');
+  assert(result[0].id === 'gmail' && result[0].name === 'Gmail' && result[0].url === 'https://example.com/1' && result[0].prefix === '📧',
+    'loadFeedConfigs: joins metadata with URL correctly');
+}
+
+{
+  const result = loadFeedConfigs(feedMeta, {});
+  assert(result.every(f => f.url === ''), 'loadFeedConfigs: missing URLs default to empty string');
+}
+
+{
+  const result = loadFeedConfigs([], feedUrls);
+  assert(result.length === 0, 'loadFeedConfigs: empty metadata returns empty array');
+}
+
+// ── loadViewConfig tests ───────────────────────────────────────────────────────
+
+{
+  const result = loadViewConfig('full', viewConfigs, viewTokens);
+  assert(result !== null, 'loadViewConfig: returns config for valid view');
+  assert(result.token === 'abc123fulltoken', 'loadViewConfig: includes token from secret');
+  assert(result.calendarName === 'Adam (all)', 'loadViewConfig: includes calendarName from KV');
+  assert(JSON.stringify(result.feeds) === JSON.stringify(['gmail', 'work', 'personal', 'tripit', 'f1']),
+    'loadViewConfig: includes feeds from KV');
+}
+
+{
+  const result = loadViewConfig('nonexistent', viewConfigs, viewTokens);
+  assert(result === null, 'loadViewConfig: returns null for missing token');
+}
+
+{
+  const result = loadViewConfig('full', {}, viewTokens);
+  assert(result === null, 'loadViewConfig: returns null for missing view config');
 }
 
 // Summary

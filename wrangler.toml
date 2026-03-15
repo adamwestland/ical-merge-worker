@@ -22,13 +22,19 @@ id = "933fa781343f4e1a91b5757cffe1d3a3"
 CACHE_TTL_SECONDS = "900"   # 15 minutes
 
 # ─── Secrets ──────────────────────────────────────────────────────────────────
-# CALENDAR_FEEDS and VIEWS are stored as encrypted Cloudflare secrets.
-# Set them with:
-#   npx wrangler secret put CALENDAR_FEEDS
-#   npx wrangler secret put VIEWS
+# Only truly secret values live in encrypted secrets. All other config is in KV.
+# Set secrets with:
+#   npx wrangler secret put FEED_URLS
+#   npx wrangler secret put VIEW_TOKENS
 #
-# CALENDAR_FEEDS format (JSON array):
-#   [{ "id": "gmail", "name": "Gmail", "url": "https://...", "prefix": "📧" }, ...]
+# FEED_URLS format (JSON object mapping feed id → URL):
+#   { "gmail": "https://...", "work": "https://...", ... }
 #
-# VIEWS format (JSON object):
-#   { "full": { "token": "<openssl rand -hex 32>", "feeds": ["gmail", ...], "calendarName": "..." }, ... }
+# VIEW_TOKENS format (JSON object mapping view name → token):
+#   { "full": "<openssl rand -hex 32>", "julie": "<openssl rand -hex 32>" }
+#
+# ─── KV Config Keys ──────────────────────────────────────────────────────────
+# Non-secret config lives in the SETTINGS KV namespace (visible/editable in dashboard):
+#   config:feeds  → [{ "id": "gmail", "name": "Gmail", "prefix": "📧" }, ...]
+#   config:views  → { "full": { "feeds": ["gmail", ...], "calendarName": "..." }, ... }
+#   view:<name>:feeds → [...] (per-view feed overrides from settings UI)

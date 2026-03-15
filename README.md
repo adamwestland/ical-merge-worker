@@ -60,34 +60,36 @@ npx wrangler login    # Opens browser for Cloudflare OAuth
 npx wrangler whoami   # Verify it worked
 ```
 
-### 4. Configure your feeds
+### 4. Create a KV namespace for config
 
-Create a JSON array of your calendar feeds:
+```bash
+npx wrangler kv:namespace create SETTINGS
+```
 
-```json
-[
-  {
-    "id": "google",
-    "name": "Google Calendar",
-    "url": "https://calendar.google.com/calendar/ical/YOU/basic.ics",
-    "prefix": "📧"
-  },
-  {
-    "id": "work",
-    "name": "Work",
-    "url": "https://outlook.office365.com/owa/calendar/.../calendar.ics",
-    "prefix": "🏢"
-  }
-]
+Copy the namespace ID into `wrangler.toml` under `[[kv_namespaces]]`.
+
+### 5. Configure your feeds
+
+Feed metadata (names, prefixes) goes in KV. Feed URLs (secret) go in a Cloudflare secret.
+
+```bash
+# Non-secret config → KV
+npx wrangler kv:key put --namespace-id=YOUR_NS_ID "config:feeds" '[
+  { "id": "google", "name": "Google Calendar", "prefix": "📧" },
+  { "id": "work", "name": "Work", "prefix": "🏢" }
+]'
+
+# Secret URLs → encrypted secret (paste JSON when prompted)
+npx wrangler secret put FEED_URLS
+# Format: { "google": "https://calendar.google.com/...", "work": "https://outlook.office365.com/..." }
 ```
 
 Each feed needs:
 - **`id`** — unique short name (referenced by views)
-- **`name`** — display name (for logs only)
-- **`url`** — the iCal feed URL
+- **`name`** — display name (for logs and settings UI)
 - **`prefix`** — (optional) emoji prepended to event titles
 
-### 5. Configure views
+### 6. Configure views
 
 Generate tokens and define who sees what:
 
@@ -96,35 +98,25 @@ Generate tokens and define who sees what:
 openssl rand -hex 32
 ```
 
-```json
-{
-  "full": {
-    "token": "PASTE_GENERATED_TOKEN_HERE",
-    "feeds": ["google", "work"],
-    "calendarName": "My Calendar"
-  },
-  "partner": {
-    "token": "PASTE_ANOTHER_TOKEN_HERE",
-    "feeds": ["google"],
-    "calendarName": "My Schedule"
-  }
-}
+```bash
+# Non-secret config → KV
+npx wrangler kv:key put --namespace-id=YOUR_NS_ID "config:views" '{
+  "full": { "feeds": ["google", "work"], "calendarName": "My Calendar" },
+  "partner": { "feeds": ["google"], "calendarName": "My Schedule" }
+}'
+
+# Secret tokens → encrypted secret (paste JSON when prompted)
+npx wrangler secret put VIEW_TOKENS
+# Format: { "full": "GENERATED_TOKEN", "partner": "ANOTHER_TOKEN" }
 ```
 
-### 6. Upload secrets and deploy
+### 7. Deploy
 
 ```bash
-# Store feeds (paste your JSON when prompted)
-npx wrangler secret put CALENDAR_FEEDS
-
-# Store views (paste your JSON when prompted)
-npx wrangler secret put VIEWS
-
-# Deploy
 npx wrangler deploy
 ```
 
-### 7. Test
+### 8. Test
 
 ```bash
 # Health check
@@ -140,7 +132,7 @@ curl "https://ical-merge.YOUR_SUBDOMAIN.workers.dev/calendar.ics?token=YOUR_TOKE
 # → valid .ics data
 ```
 
-### 8. Subscribe
+### 9. Subscribe
 
 Add the URL to any calendar app:
 - **Google Calendar:** Other calendars (+) → From URL → paste the full URL with token
@@ -178,6 +170,21 @@ Right-click the subscription calendar in Calendar.app → Get Info → copy the 
 
 ## Configuration Reference
 
+### Secrets (encrypted, set via `wrangler secret put`)
+
+| Secret | Format | Description |
+|--------|--------|-------------|
+| `FEED_URLS` | `{ "id": "url", ... }` | Feed ID → iCal URL mapping |
+| `VIEW_TOKENS` | `{ "view": "token", ... }` | View name → auth token mapping |
+
+### KV keys (visible in dashboard, editable at runtime)
+
+| Key | Format | Description |
+|-----|--------|-------------|
+| `config:feeds` | `[{ id, name, prefix }, ...]` | Feed metadata |
+| `config:views` | `{ "view": { feeds, calendarName }, ... }` | View configuration |
+| `view:<name>:feeds` | `["id", ...]` | Per-view feed overrides (set via settings UI) |
+
 ### wrangler.toml
 
 | Variable | Description | Default |
@@ -190,13 +197,15 @@ Right-click the subscription calendar in Calendar.app → Get Info → copy the 
 |------|------|-------------|
 | `/health` | None | Returns `200 ok` |
 | `/calendar.ics?token=...&view=...` | Token required | Merged iCal feed |
+| `/settings?token=...&view=...` | Token required | Feed toggle UI |
+| `/api/feeds?token=...&view=...` | Token required | Feed list API (GET/PUT) |
 
 The `view` parameter defaults to `full` if omitted.
 
 ## Development
 
 ```bash
-npm test              # Run all 21 unit tests
+npm test              # Run unit tests
 npx wrangler dev      # Local dev server
 npx wrangler tail     # Stream production logs
 ```

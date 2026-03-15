@@ -14,7 +14,7 @@ Cloudflare Worker that merges multiple iCal feeds into one subscribable `.ics` e
 ## Commands
 
 ```bash
-npm test              # Run all 21 unit tests
+npm test              # Run all unit tests
 npx wrangler dev      # Local dev server
 npx wrangler deploy   # Deploy to Cloudflare
 npx wrangler tail     # Stream production logs
@@ -31,16 +31,20 @@ wrangler.toml      # Cloudflare config (non-secret vars, route, compat date)
 ## Key Design Decisions
 
 - **Single file architecture** — the entire worker is `src/index.ts`. No need to split unless it grows significantly.
-- **Secrets not in source** — `CALENDAR_FEEDS` (feed URLs) and `VIEWS` (tokens + feed mappings) are Cloudflare encrypted secrets, set via `npx wrangler secret put`. Never commit real URLs or tokens.
+- **Secrets not in source** — `FEED_URLS` (feed URLs) and `VIEW_TOKENS` (auth tokens) are Cloudflare encrypted secrets, set via `npx wrangler secret put`. Non-secret config (names, prefixes, feed assignments, calendar names) lives in the `SETTINGS` KV namespace under `config:feeds` and `config:views` keys. Never commit real URLs or tokens.
 - **Tests duplicate core functions** — `test/test.mjs` copies `extractEvents`, `timingSafeEqual`, etc. from the source since the worker code can't be directly imported into Node.js. When changing core logic, update both files.
 - **No runtime dependencies** — the worker uses only Web APIs available in the Workers runtime.
 
 ## Secrets Management
 
 ```bash
-npx wrangler secret put CALENDAR_FEEDS   # JSON array of feed configs
-npx wrangler secret put VIEWS            # JSON object of view configs with tokens
+npx wrangler secret put FEED_URLS      # JSON object: { "gmail": "https://...", ... }
+npx wrangler secret put VIEW_TOKENS    # JSON object: { "full": "abc...", "julie": "xyz..." }
 ```
+
+Non-secret config lives in the `SETTINGS` KV namespace:
+- `config:feeds` — `[{ "id": "gmail", "name": "Gmail", "prefix": "📧" }, ...]`
+- `config:views` — `{ "full": { "feeds": ["gmail", ...], "calendarName": "..." }, ... }`
 
 Tokens are generated with `openssl rand -hex 32`.
 

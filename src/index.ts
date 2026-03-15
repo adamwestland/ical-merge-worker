@@ -20,15 +20,16 @@
  *   GET /settings?token=X&view=julie                   (feed toggle UI)
  *
  * Environment Variables (set in wrangler.toml or via `wrangler secret put`):
- *   CALENDAR_FEEDS    – JSON array of feed configs, each with a unique `id`
- *   VIEWS             – JSON object mapping view names to { token, feeds[], calendarName }
+ *   FEED_URLS         – JSON object mapping feed id to URL: { "gmail": "https://...", ... }
+ *   VIEW_TOKENS       – JSON object mapping view name to token: { "full": "abc...", ... }
  *   CACHE_TTL_SECONDS – How long to cache the merged result (default: 900 = 15 min)
- *   SETTINGS          – KV namespace for per-view feed overrides
+ *   SETTINGS          – KV namespace for feed metadata, view config, and per-view overrides
+ *                       KV keys: config:feeds, config:views, view:<name>:feeds
  */
 
 export interface Env {
-	CALENDAR_FEEDS: string;
-	VIEWS: string;
+	FEED_URLS: string;
+	VIEW_TOKENS: string;
 	CACHE_TTL_SECONDS?: string;
 	SETTINGS: KVNamespace;
 }
@@ -94,26 +95,59 @@ export default {
 	},
 };
 
+// ─── Config Loaders ───────────────────────────────────────────────────────────
+
+async function loadFeedConfigs(env: Env): Promise<FeedConfig[]> {
+	const feedsJson = await env.SETTINGS.get('config:feeds');
+	if (!feedsJson) return [];
+	const feedMeta: Array<{ id: string; name: string; prefix?: string }> = JSON.parse(feedsJson);
+	const feedUrls: Record<string, string> = JSON.parse(env.FEED_URLS);
+
+	return feedMeta.map(meta => ({
+		id: meta.id,
+		name: meta.name,
+		url: feedUrls[meta.id] || '',
+		prefix: meta.prefix,
+	}));
+}
+
+async function loadViewConfig(viewName: string, env: Env): Promise<ViewConfig | null> {
+	const viewTokens: Record<string, string> = JSON.parse(env.VIEW_TOKENS);
+	const token = viewTokens[viewName];
+	if (!token) return null;
+
+	const viewsJson = await env.SETTINGS.get('config:views');
+	if (!viewsJson) return null;
+	const views: Record<string, { feeds: string[]; calendarName: string }> = JSON.parse(viewsJson);
+	const config = views[viewName];
+	if (!config) return null;
+
+	return { token, feeds: config.feeds, calendarName: config.calendarName };
+}
+
 // ─── Auth Helper ──────────────────────────────────────────────────────────────
 
-function authenticateView(
+async function authenticateView(
 	url: URL,
 	env: Env
-): { view: ViewConfig; viewName: string } | null {
-	const views: Record<string, ViewConfig> = JSON.parse(env.VIEWS);
+): Promise<{ view: ViewConfig; viewName: string } | null> {
+	const viewTokens: Record<string, string> = JSON.parse(env.VIEW_TOKENS);
 	const viewName = url.searchParams.get('view') || 'full';
 	const token = url.searchParams.get('token') || '';
 
 	const dummyToken = 'x'.repeat(64);
-	const expectedToken = views[viewName]?.token || dummyToken;
+	const expectedToken = viewTokens[viewName] || dummyToken;
 	const tokenValid = timingSafeEqual(token, expectedToken);
-	const viewExists = viewName in views;
+	const tokenExists = viewName in viewTokens;
 
-	if (!tokenValid || !viewExists) {
+	if (!tokenValid || !tokenExists) {
 		return null;
 	}
 
-	return { view: views[viewName], viewName };
+	const view = await loadViewConfig(viewName, env);
+	if (!view) return null;
+
+	return { view, viewName };
 }
 
 // ─── Calendar Route ───────────────────────────────────────────────────────────
@@ -124,7 +158,7 @@ async function handleCalendar(
 	env: Env,
 	ctx: ExecutionContext
 ): Promise<Response> {
-	const auth = authenticateView(url, env);
+	const auth = await authenticateView(url, env);
 	if (!auth) {
 		return new Response('Unauthorized', { status: 401 });
 	}
@@ -139,8 +173,8 @@ async function handleCalendar(
 		return cachedResponse;
 	}
 
-	// ── Filter feeds for this view (KV override → VIEWS fallback) ─────────
-	const allFeeds: FeedConfig[] = JSON.parse(env.CALENDAR_FEEDS);
+	// ── Filter feeds for this view (KV override → config fallback) ────────
+	const allFeeds = await loadFeedConfigs(env);
 	const kvFeeds = await env.SETTINGS.get(`view:${viewName}:feeds`);
 	const feedIds = new Set(kvFeeds ? JSON.parse(kvFeeds) : view.feeds);
 	const viewFeeds = allFeeds.filter(f => feedIds.has(f.id));
@@ -170,7 +204,7 @@ async function handleCalendar(
 // ─── Settings Page ────────────────────────────────────────────────────────────
 
 async function handleSettingsPage(url: URL, env: Env): Promise<Response> {
-	const auth = authenticateView(url, env);
+	const auth = await authenticateView(url, env);
 	if (!auth) {
 		return new Response('Unauthorized', { status: 401 });
 	}
@@ -321,13 +355,13 @@ function escapeHtml(s: string): string {
 // ─── Feeds API ────────────────────────────────────────────────────────────────
 
 async function handleFeedsApi(request: Request, url: URL, env: Env): Promise<Response> {
-	const auth = authenticateView(url, env);
+	const auth = await authenticateView(url, env);
 	if (!auth) {
 		return new Response('Unauthorized', { status: 401 });
 	}
 
 	const { view, viewName } = auth;
-	const allFeeds: FeedConfig[] = JSON.parse(env.CALENDAR_FEEDS);
+	const allFeeds = await loadFeedConfigs(env);
 
 	if (request.method === 'GET') {
 		const kvFeeds = await env.SETTINGS.get(`view:${viewName}:feeds`);
@@ -435,15 +469,27 @@ async function mergeFeeds(feeds: FeedConfig[], calendarName: string): Promise<st
 	);
 
 	const taggedEvents: TaggedEvent[] = [];
+	const seenTZIDs = new Set<string>();
+	const timezones: string[] = [];
 
 	for (let i = 0; i < results.length; i++) {
 		const result = results[i];
 		const feed = feeds[i];
 
 		if (result.status === 'fulfilled') {
-			const events = extractEvents(result.value);
+			const icalText = result.value;
+			const events = extractEvents(icalText);
 			for (const raw of events) {
 				taggedEvents.push({ raw, feedId: feed.id, prefix: feed.prefix });
+			}
+			// Collect VTIMEZONE blocks, deduplicated by TZID
+			for (const tz of extractTimezones(icalText)) {
+				const tzidMatch = tz.match(/TZID:(.+)/);
+				const tzid = tzidMatch ? tzidMatch[1] : tz;
+				if (!seenTZIDs.has(tzid)) {
+					seenTZIDs.add(tzid);
+					timezones.push(tz);
+				}
 			}
 			console.log(`✓ ${feed.name}: ${events.length} events`);
 		} else {
@@ -454,7 +500,7 @@ async function mergeFeeds(feeds: FeedConfig[], calendarName: string): Promise<st
 	const deduped = deduplicateEvents(taggedEvents);
 	const serialized = deduped.map(e => serializeEvent(e));
 
-	return buildCalendar(calendarName, serialized);
+	return buildCalendar(calendarName, timezones, serialized);
 }
 
 async function fetchFeed(feed: FeedConfig): Promise<string> {
@@ -481,6 +527,30 @@ async function fetchFeed(feed: FeedConfig): Promise<string> {
 }
 
 // ─── iCal Parsing ─────────────────────────────────────────────────────────────
+
+function extractTimezones(icalText: string): string[] {
+	const unfolded = icalText.replace(/\r?\n[ \t]/g, '');
+	const timezones: string[] = [];
+	const lines = unfolded.split(/\r?\n/);
+
+	let inTZ = false;
+	let tzLines: string[] = [];
+
+	for (const line of lines) {
+		if (line === 'BEGIN:VTIMEZONE') {
+			inTZ = true;
+			tzLines = [line];
+		} else if (line === 'END:VTIMEZONE' && inTZ) {
+			tzLines.push(line);
+			inTZ = false;
+			timezones.push(tzLines.join('\r\n'));
+		} else if (inTZ) {
+			tzLines.push(line);
+		}
+	}
+
+	return timezones;
+}
 
 function extractEvents(icalText: string, prefix?: string): string[] {
 	const unfolded = icalText.replace(/\r?\n[ \t]/g, '');
@@ -528,10 +598,17 @@ function parseEvent(tagged: TaggedEvent): ParsedEvent {
 	for (const line of lines) {
 		const colonIdx = line.indexOf(':');
 		if (colonIdx === -1) continue;
-		let key = line.slice(0, colonIdx);
-		// Strip parameters (e.g. DTSTART;TZID=... → DTSTART)
+		const fullKey = line.slice(0, colonIdx);
+		let key = fullKey;
 		const semiIdx = key.indexOf(';');
-		if (semiIdx !== -1) key = key.slice(0, semiIdx);
+		if (semiIdx !== -1) {
+			const params = fullKey.slice(semiIdx + 1);
+			key = key.slice(0, semiIdx);
+			const tzMatch = params.match(/TZID=([^;]+)/);
+			if (tzMatch) {
+				fields[key + '_TZID'] = tzMatch[1];
+			}
+		}
 		fields[key] = line.slice(colonIdx + 1);
 	}
 	return { lines, fields, feedId: tagged.feedId, prefix: tagged.prefix };
@@ -579,17 +656,52 @@ function titlesMatch(a: string, b: string): boolean {
 	return diceCoefficient(na, nb) >= 0.75;
 }
 
-function parseICalDateTime(value: string): number | null {
-	// Handles: 20260315T100000Z or 20260315T100000
-	const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/);
+function parseICalDateTime(value: string, tzid?: string): number | null {
+	// All-day: 20260315
+	const dateOnly = value.match(/^(\d{4})(\d{2})(\d{2})$/);
+	if (dateOnly) {
+		const [, y, mo, d] = dateOnly;
+		return Date.UTC(+y, +mo - 1, +d);
+	}
+
+	// DateTime with Z suffix — already UTC
+	if (value.endsWith('Z')) {
+		const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+		if (!match) return null;
+		const [, y, mo, d, h, mi, s] = match;
+		return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+	}
+
+	// DateTime without Z — local time, optionally with TZID
+	const match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/);
 	if (!match) return null;
 	const [, y, mo, d, h, mi, s] = match;
-	return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+
+	if (!tzid) {
+		// No timezone info — treat as UTC (best effort)
+		return Date.UTC(+y, +mo - 1, +d, +h, +mi, +s);
+	}
+
+	return localTimeToUTC(+y, +mo - 1, +d, +h, +mi, +s, tzid);
+}
+
+function localTimeToUTC(
+	y: number, mo: number, d: number, h: number, mi: number, s: number, tzid: string
+): number {
+	// Treat the local time as if it were UTC, then compute the offset
+	const guessUTC = Date.UTC(y, mo, d, h, mi, s);
+	const localStr = new Date(guessUTC).toLocaleString('sv-SE', { timeZone: tzid });
+	// sv-SE format: "2026-03-15 06:00:00"
+	const [datePart, timePart] = localStr.split(' ');
+	const [ly, lmo, ld] = datePart.split('-').map(Number);
+	const [lh, lmi, ls] = timePart.split(':').map(Number);
+	const localAsUTC = Date.UTC(ly, lmo - 1, ld, lh, lmi, ls);
+	return guessUTC - (localAsUTC - guessUTC);
 }
 
 function timesOverlap(a: ParsedEvent, b: ParsedEvent): boolean {
-	const aStart = parseICalDateTime(a.fields['DTSTART'] || '');
-	const bStart = parseICalDateTime(b.fields['DTSTART'] || '');
+	const aStart = parseICalDateTime(a.fields['DTSTART'] || '', a.fields['DTSTART_TZID']);
+	const bStart = parseICalDateTime(b.fields['DTSTART'] || '', b.fields['DTSTART_TZID']);
 	if (aStart === null || bStart === null) return false;
 	return Math.abs(aStart - bStart) <= 5 * 60 * 1000; // 5 minutes
 }
@@ -676,7 +788,7 @@ function serializeEvent(parsed: ParsedEvent): string {
 	return lines.join('\r\n');
 }
 
-function buildCalendar(name: string, events: string[]): string {
+function buildCalendar(name: string, timezones: string[], events: string[]): string {
 	const header = [
 		'BEGIN:VCALENDAR',
 		'VERSION:2.0',
@@ -690,5 +802,5 @@ function buildCalendar(name: string, events: string[]): string {
 
 	const footer = ['END:VCALENDAR'];
 
-	return [...header, ...events, ...footer].join('\r\n');
+	return [...header, ...timezones, ...events, ...footer].join('\r\n');
 }
