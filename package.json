@@ -1,0 +1,16 @@
+{
+  "name": "ical-merge-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that merges multiple iCal feeds into a single subscribable .ics endpoint",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test/test.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241205.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.73.0"
+  }
+}
