@@ -801,6 +801,7 @@ function mergeEvents(a: ParsedEvent, b: ParsedEvent): ParsedEvent {
 		fields: { ...secondary.fields, ...primary.fields },
 		feedId: primary.feedId,
 		prefix: primary.prefix,
+		startUTC: primary.startUTC,
 	};
 }
 

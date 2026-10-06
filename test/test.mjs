@@ -319,6 +319,7 @@ function mergeEvents(a, b) {
     fields: { ...secondary.fields, ...primary.fields },
     feedId: primary.feedId,
     prefix: primary.prefix,
+    startUTC: primary.startUTC,
   };
 }
 
@@ -840,6 +841,26 @@ END:VCALENDAR`;
 {
   const result = loadViewConfig('full', {}, viewTokens);
   assert(result === null, 'loadViewConfig: returns null for missing view config');
+}
+
+// Regression: a merged pair must retain its time so a third feed can match.
+{
+  const tagged = ['work', 'personal', 'tripit'].map((feedId, index) => ({
+    feedId,
+    raw: [
+      'BEGIN:VEVENT',
+      `UID:${feedId}@example.com`,
+      index === 1 ? 'DTSTART;TZID=America/Toronto:20260315T100000' : 'DTSTART:20260315T140000Z',
+      'SUMMARY:Team Standup',
+      ...(index === 1 ? ['DESCRIPTION:Richest event', 'LOCATION:Office'] : []),
+      'END:VEVENT',
+    ].join('\r\n'),
+  }));
+  const result = deduplicateEvents(tagged);
+  assert(result.length === 1, 'dedup: merges three feeds after richer secondary wins');
+  assert(result[0].startUTC === Date.UTC(2026, 2, 15, 14), 'dedup: retains primary UTC start');
+  assert(result[0].fields['DTSTART_TZID'] === 'America/Toronto', 'dedup: retains primary timezone');
+  assert(result[0].fields['LOCATION'] === 'Office', 'dedup: retains rich fields after repeated merge');
 }
 
 // Summary
